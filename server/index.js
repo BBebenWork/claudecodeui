@@ -30,7 +30,7 @@ const os = require('os');
 const pty = require('node-pty');
 const fetch = require('node-fetch');
 
-const { getProjects, getSessions, getSessionMessages, renameProject, deleteSession, deleteAllSessions, deleteProject, addProjectManually, extractProjectDirectory, clearProjectDirectoryCache } = require('./projects');
+const { getProjects, getSessions, getSessionMessages, renameProject, deleteSession, deleteAllSessions, deleteProject, addProjectManually, extractProjectDirectory, clearProjectDirectoryCache, loadProjectConfig, saveProjectConfig } = require('./projects');
 const { spawnClaude, abortClaudeSession } = require('./claude-cli');
 const gitRoutes = require('./routes/git');
 const { createCheckpoint, restoreCheckpoint, getCheckpoints, deleteCheckpoint, clearProjectCheckpoints } = require('./checkpoints');
@@ -101,7 +101,7 @@ function setupProjectsWatcher() {
         } catch (error) {
           console.error('❌ Error handling project changes:', error);
         }
-      }, 300); // 300ms debounce (slightly faster than before)
+      }, 150); // 150ms debounce (faster response for new sessions)
     };
     
     // Set up event listeners
@@ -258,7 +258,9 @@ app.get('/api/projects/:projectName/sessions', async (req, res) => {
 app.get('/api/projects/:projectName/sessions/:sessionId/messages', async (req, res) => {
   try {
     const { projectName, sessionId } = req.params;
+    
     const messages = await getSessionMessages(projectName, sessionId);
+    
     res.json({ messages });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -312,16 +314,361 @@ app.delete('/api/projects/:projectName', async (req, res) => {
 // Create project endpoint
 app.post('/api/projects/create', async (req, res) => {
   try {
-    const { path: projectPath } = req.body;
+    const { path: projectPath, displayName } = req.body;
     
     if (!projectPath || !projectPath.trim()) {
       return res.status(400).json({ error: 'Project path is required' });
     }
     
-    const project = await addProjectManually(projectPath.trim());
+    const project = await addProjectManually(projectPath.trim(), displayName?.trim() || null);
     res.json({ success: true, project });
   } catch (error) {
     console.error('Error creating project:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Debug endpoint for project configuration
+app.get('/api/projects/debug/:projectPath(*)', async (req, res) => {
+  try {
+    const projectPath = '/' + req.params.projectPath; // Restore leading slash
+    const absolutePath = path.resolve(projectPath);
+    
+    // Generate the encoded project name
+    let projectName = absolutePath;
+    if (projectName.startsWith('/')) {
+      projectName = projectName.substring(1);
+    }
+    projectName = projectName.replace(/\//g, '-').replace(/\s+/g, '_');
+    
+    const config = await loadProjectConfig();
+    const projectDir = path.join(process.env.HOME, '.claude', 'projects', projectName);
+    
+    // Check various states
+    const pathExists = await fs.access(absolutePath).then(() => true).catch(() => false);
+    const projectDirExists = await fs.access(projectDir).then(() => true).catch(() => false);
+    const configEntry = config[projectName] || null;
+    
+    // Get all existing projects
+    const existingProjects = await getProjects();
+    const duplicateProject = existingProjects.find(project => 
+      project.path === absolutePath || project.fullPath === absolutePath
+    );
+    
+    res.json({
+      requestedPath: absolutePath,
+      encodedName: projectName,
+      pathExists,
+      projectDirExists,
+      configEntry,
+      duplicateProject: duplicateProject ? {
+        name: duplicateProject.name,
+        displayName: duplicateProject.displayName,
+        path: duplicateProject.path,
+        fullPath: duplicateProject.fullPath,
+        isManuallyAdded: duplicateProject.isManuallyAdded
+      } : null,
+      allProjects: existingProjects.map(p => ({
+        name: p.name,
+        displayName: p.displayName,
+        path: p.path,
+        fullPath: p.fullPath,
+        isManuallyAdded: p.isManuallyAdded
+      }))
+    });
+  } catch (error) {
+    console.error('Error debugging project:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Reset project configuration endpoint (for debugging)
+app.delete('/api/projects/config/:projectName', async (req, res) => {
+  try {
+    const { projectName } = req.params;
+    const config = await loadProjectConfig();
+    
+    if (config[projectName]) {
+      delete config[projectName];
+      await saveProjectConfig(config);
+      
+      // Also clear the directory cache
+      clearProjectDirectoryCache();
+      
+      res.json({ success: true, message: `Removed ${projectName} from configuration` });
+    } else {
+      res.status(404).json({ error: 'Project not found in configuration' });
+    }
+  } catch (error) {
+    console.error('Error removing project config:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Clean up all orphaned project configurations
+app.post('/api/projects/cleanup', async (req, res) => {
+  try {
+    const config = await loadProjectConfig();
+    const claudeDir = path.join(process.env.HOME, '.claude', 'projects');
+    
+    // Check if Claude projects directory exists
+    let projectDirExists = false;
+    try {
+      await fs.access(claudeDir);
+      projectDirExists = true;
+    } catch (error) {
+      // Directory doesn't exist
+    }
+    
+    if (!projectDirExists) {
+      // If projects directory doesn't exist, clear all config
+      if (Object.keys(config).length > 0) {
+        await saveProjectConfig({});
+        clearProjectDirectoryCache();
+        
+        res.json({ 
+          success: true, 
+          message: `Cleaned up ${Object.keys(config).length} orphaned configuration entries`,
+          removedProjects: Object.keys(config)
+        });
+      } else {
+        res.json({ 
+          success: true, 
+          message: 'No orphaned configurations found',
+          removedProjects: []
+        });
+      }
+    } else {
+      // Projects directory exists, only remove configs without corresponding directories
+      const entries = await fs.readdir(claudeDir, { withFileTypes: true });
+      const existingProjectNames = new Set(
+        entries.filter(entry => entry.isDirectory()).map(entry => entry.name)
+      );
+      
+      const orphanedConfigs = [];
+      const cleanedConfig = {};
+      
+      for (const [projectName, projectConfig] of Object.entries(config)) {
+        if (existingProjectNames.has(projectName)) {
+          // Keep configs that have corresponding directories
+          cleanedConfig[projectName] = projectConfig;
+        } else {
+          // Remove orphaned configs
+          orphanedConfigs.push(projectName);
+        }
+      }
+      
+      if (orphanedConfigs.length > 0) {
+        await saveProjectConfig(cleanedConfig);
+        clearProjectDirectoryCache();
+        
+        res.json({ 
+          success: true, 
+          message: `Cleaned up ${orphanedConfigs.length} orphaned configuration entries`,
+          removedProjects: orphanedConfigs
+        });
+      } else {
+        res.json({ 
+          success: true, 
+          message: 'No orphaned configurations found',
+          removedProjects: []
+        });
+      }
+    }
+  } catch (error) {
+    console.error('Error cleaning up project configurations:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// File browser endpoint
+app.get('/api/browse-directories', async (req, res) => {
+  try {
+    const { path: browsePath, mode } = req.query;
+    
+    // Default to root directories if no path provided
+    const targetPath = browsePath || '/';
+    const navigationMode = mode || 'windows'; // Default to Windows mode
+    
+    // Helper function to get Windows username
+    const getWindowsUsername = async () => {
+      try {
+        // Try to find the Windows username from common paths
+        const usersPath = '/mnt/c/Users';
+        const userDirs = await fs.readdir(usersPath, { withFileTypes: true });
+        const userFolders = userDirs.filter(dir => 
+          dir.isDirectory() && 
+          !['Public', 'Default', 'All Users'].includes(dir.name) &&
+          !dir.name.startsWith('.')
+        );
+        
+        // Return the first valid user folder (usually the main user)
+        return userFolders.length > 0 ? userFolders[0].name : null;
+      } catch (e) {
+        return null;
+      }
+    };
+    
+    // Add Windows shortcuts if we're at root and have WSL access
+    const addWindowsShortcuts = async () => {
+      const shortcuts = [];
+      
+      try {
+        // Check if we have access to Windows C: drive
+        await fs.access('/mnt/c');
+        
+        // Get Windows username
+        const username = await getWindowsUsername();
+        
+        if (username) {
+          const userPath = `/mnt/c/Users/${username}`;
+          
+          // Add common Windows folders
+          const commonFolders = [
+            { name: '🖥️ Desktop', path: `${userPath}/Desktop`, icon: 'desktop' },
+            { name: '📁 Documents', path: `${userPath}/Documents`, icon: 'documents' },
+            { name: '⬇️ Downloads', path: `${userPath}/Downloads`, icon: 'downloads' },
+            { name: '🖼️ Pictures', path: `${userPath}/Pictures`, icon: 'pictures' },
+            { name: '🎵 Music', path: `${userPath}/Music`, icon: 'music' },
+            { name: '🎬 Videos', path: `${userPath}/Videos`, icon: 'videos' },
+          ];
+          
+          // Check which folders exist and add them
+          for (const folder of commonFolders) {
+            try {
+              const stats = await fs.stat(folder.path);
+              if (stats.isDirectory()) {
+                shortcuts.push({
+                  name: folder.name,
+                  path: folder.path,
+                  isDirectory: true,
+                  isWindowsShortcut: true,
+                  icon: folder.icon
+                });
+              }
+            } catch (e) {
+              // Folder doesn't exist, skip
+            }
+          }
+        }
+        
+        // Add drives
+        for (let i = 65; i <= 90; i++) { // A-Z
+          const drive = String.fromCharCode(i);
+          try {
+            await fs.access(`/mnt/${drive.toLowerCase()}`);
+            shortcuts.push({
+              name: `${drive}: Drive`,
+              path: `/mnt/${drive.toLowerCase()}`,
+              isDirectory: true,
+              isWslMount: true
+            });
+          } catch (e) {
+            // Drive doesn't exist, skip
+          }
+        }
+        
+      } catch (e) {
+        // No WSL access, just show regular Linux root
+      }
+      
+      return shortcuts;
+    };
+    
+    // Handle navigation based on mode
+    let normalizedPath = targetPath;
+    
+    if (navigationMode === 'windows') {
+      // Windows navigation mode
+      if (targetPath === '/' || targetPath === '') {
+        const shortcuts = await addWindowsShortcuts();
+        return res.json({ 
+          directories: shortcuts, 
+          currentPath: '/', 
+          mode: 'windows',
+          parentPath: null 
+        });
+      }
+      
+      // Convert WSL path back to Windows path for access if needed
+      const wslMatch = targetPath.match(/^\/mnt\/([a-z])(.*)$/);
+      if (wslMatch) {
+        const drive = wslMatch[1].toUpperCase();
+        const remainingPath = wslMatch[2] || '';
+        if (os.platform() === 'win32') {
+          normalizedPath = `${drive}:${remainingPath.replace(/\//g, '\\')}`;
+        } else {
+          normalizedPath = targetPath; // Keep WSL format on Linux
+        }
+      }
+    } else {
+      // Linux navigation mode
+      if (targetPath === '/' || targetPath === '') {
+        normalizedPath = '/';
+      }
+      // For Linux mode, use paths as-is
+    }
+    
+    // Check if path exists
+    try {
+      const stats = await fs.stat(normalizedPath);
+      if (!stats.isDirectory()) {
+        return res.status(400).json({ error: 'Path is not a directory' });
+      }
+    } catch (error) {
+      return res.status(404).json({ error: 'Path does not exist' });
+    }
+    
+    // Read directory contents
+    const entries = await fs.readdir(normalizedPath, { withFileTypes: true });
+    
+    // Filter to only include directories and convert to our format
+    const directories = entries
+      .filter(entry => entry.isDirectory())
+      .map(entry => {
+        const entryPath = path.join(normalizedPath, entry.name);
+        // Convert back to WSL format if on Windows
+        let displayPath = entryPath;
+        if (os.platform() === 'win32') {
+          const windowsMatch = entryPath.match(/^([A-Z]):(.*)$/);
+          if (windowsMatch) {
+            const drive = windowsMatch[1].toLowerCase();
+            const remainingPath = windowsMatch[2].replace(/\\/g, '/');
+            displayPath = `/mnt/${drive}${remainingPath}`;
+          }
+        }
+        
+        return {
+          name: entry.name,
+          path: displayPath,
+          isDirectory: true
+        };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+    
+    // Calculate parent path based on mode
+    let parentPath = null;
+    if (targetPath !== '/') {
+      if (navigationMode === 'windows' && targetPath.match(/^\/mnt\/[a-z]$/)) {
+        // If we're at a drive root in Windows mode, parent is the Windows root
+        parentPath = '/';
+      } else {
+        parentPath = path.dirname(targetPath);
+        if (parentPath === '/' && navigationMode === 'linux') {
+          parentPath = null; // No parent for Linux root
+        }
+      }
+    }
+    
+    res.json({ 
+      directories, 
+      currentPath: targetPath,
+      parentPath: parentPath,
+      mode: navigationMode
+    });
+    
+  } catch (error) {
+    console.error('Error browsing directories:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -473,8 +820,6 @@ app.get('/api/projects/:projectName/files', async (req, res) => {
     
     const files = await getFileTree(actualPath, 3, 0, true);
     const hiddenFiles = files.filter(f => f.name.startsWith('.'));
-    console.log('📄 Found', files.length, 'files/folders, including', hiddenFiles.length, 'hidden files');
-    console.log('🔍 Hidden files:', hiddenFiles.map(f => f.name));
     res.json(files);
   } catch (error) {
     console.error('❌ File tree error:', error.message);
@@ -948,6 +1293,9 @@ async function getFileTree(dirPath, maxDepth = 3, currentDepth = 0, showHidden =
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Claude Code UI server running on http://0.0.0.0:${PORT}`);
+  
+  // Clear project directory cache to ensure fresh decoding with updated logic
+  clearProjectDirectoryCache();
   
   // Start watching the projects folder for changes
   setupProjectsWatcher();

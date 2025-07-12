@@ -56,7 +56,7 @@ router.get('/status', async (req, res) => {
 
   try {
     const projectPath = await getActualProjectPath(project);
-    console.log('Git status for project:', project, '-> path:', projectPath);
+  
     
     // Validate git repository
     await validateGitRepository(projectPath);
@@ -135,13 +135,19 @@ router.get('/diff', async (req, res) => {
       diff = `--- /dev/null\n+++ b/${file}\n@@ -0,0 +1,${lines.length} @@\n` + 
              lines.map(line => `+${line}`).join('\n');
     } else {
-      // Get diff for tracked files
-      const { stdout } = await execAsync(`git diff HEAD -- "${file}"`, { cwd: projectPath });
+      // Get diff for tracked files with increased buffer size for large files
+      const { stdout } = await execAsync(`git diff HEAD -- "${file}"`, { 
+        cwd: projectPath,
+        maxBuffer: 50 * 1024 * 1024 // 50MB buffer for large files
+      });
       diff = stdout || '';
       
       // If no unstaged changes, check for staged changes
       if (!diff) {
-        const { stdout: stagedDiff } = await execAsync(`git diff --cached -- "${file}"`, { cwd: projectPath });
+        const { stdout: stagedDiff } = await execAsync(`git diff --cached -- "${file}"`, { 
+          cwd: projectPath,
+          maxBuffer: 50 * 1024 * 1024 // 50MB buffer for large files
+        });
         diff = stagedDiff;
       }
     }
@@ -192,7 +198,7 @@ router.get('/branches', async (req, res) => {
 
   try {
     const projectPath = await getActualProjectPath(project);
-    console.log('Git branches for project:', project, '-> path:', projectPath);
+  
     
     // Validate git repository
     await validateGitRepository(projectPath);
@@ -329,10 +335,13 @@ router.get('/commit-diff', async (req, res) => {
   try {
     const projectPath = await getActualProjectPath(project);
     
-    // Get diff for the commit
+    // Get diff for the commit with increased buffer size for large commits
     const { stdout } = await execAsync(
       `git show ${commit}`,
-      { cwd: projectPath }
+      { 
+        cwd: projectPath,
+        maxBuffer: 50 * 1024 * 1024 // 50MB buffer for large commits
+      }
     );
     
     res.json({ diff: stdout });
@@ -359,7 +368,10 @@ router.post('/generate-commit-message', async (req, res) => {
       try {
         const { stdout } = await execAsync(
           `git diff HEAD -- "${file}"`,
-          { cwd: projectPath }
+          { 
+            cwd: projectPath,
+            maxBuffer: 50 * 1024 * 1024 // 50MB buffer for large files
+          }
         );
         if (stdout) {
           combinedDiff += `\n--- ${file} ---\n${stdout}`;

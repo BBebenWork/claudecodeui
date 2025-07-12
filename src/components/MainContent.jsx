@@ -39,6 +39,7 @@ function MainContent({
   onReplaceTemporarySession, // Replace temporary session ID with real session ID from WebSocket
   onReplacePlaceholderSession, // Replace placeholder session with real session when created
   onNavigateToSession,    // Navigate to a specific session (for Claude CLI session duplication workaround)
+  onConversationSelect,   // Select a conversation in the sidebar
   onShowSettings,         // Show tools settings panel
   autoExpandTools,        // Auto-expand tool accordions
   showRawParameters,      // Show raw parameters in tool accordions
@@ -161,9 +162,14 @@ function MainContent({
                 <div>
                   <h2 className="text-base sm:text-lg font-semibold text-gray-900 dark:text-white truncate">
                     {selectedConversation.title} <span className="text-sm text-gray-500 dark:text-gray-400">({selectedConversation.sessions.length} messages)</span>
+                    {selectedConversation.isOrphaned && (
+                      <span className="ml-2 text-sm text-amber-600 dark:text-amber-400" title="Conversation from history (session files not found)">
+                        📚
+                      </span>
+                    )}
                   </h2>
                   <div className="text-xs text-gray-500 dark:text-gray-400 truncate">
-                    {selectedProject.displayName} • Full conversation history
+                    {selectedProject.displayName} • {selectedConversation.isOrphaned ? 'Historical conversation (read-only)' : 'Full conversation history'}
                   </div>
                 </div>
               ) : activeTab === 'chat' && selectedSession ? (
@@ -298,6 +304,7 @@ function MainContent({
             onReplaceTemporarySession={onReplaceTemporarySession}
             onReplacePlaceholderSession={onReplacePlaceholderSession}
             onNavigateToSession={onNavigateToSession}
+            onConversationSelect={onConversationSelect}
             onShowSettings={onShowSettings}
             autoExpandTools={autoExpandTools}
             showRawParameters={showRawParameters}

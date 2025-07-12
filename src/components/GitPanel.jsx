@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { GitBranch, GitCommit, Plus, Minus, RefreshCw, Check, X, ChevronDown, ChevronRight, Info, History, FileText, Mic, MicOff, Sparkles } from 'lucide-react';
 import { MicButton } from './MicButton.jsx';
 
@@ -23,18 +23,34 @@ function GitPanel({ selectedProject, isMobile }) {
   const [expandedCommits, setExpandedCommits] = useState(new Set());
   const [commitDiffs, setCommitDiffs] = useState({});
   const [isGeneratingMessage, setIsGeneratingMessage] = useState(false);
+  const [loadingDiffs, setLoadingDiffs] = useState(new Set()); // Track which diffs are loading
   const textareaRef = useRef(null);
   const dropdownRef = useRef(null);
+  const fetchTimeoutRef = useRef(null);
 
+  // Single useEffect with debouncing to prevent repeated calls during rapid project updates
   useEffect(() => {
-    if (selectedProject) {
-      fetchGitStatus();
-      fetchBranches();
-      if (activeView === 'history') {
-        fetchRecentCommits();
-      }
+    if (fetchTimeoutRef.current) {
+      clearTimeout(fetchTimeoutRef.current);
     }
-  }, [selectedProject, activeView]);
+    
+    fetchTimeoutRef.current = setTimeout(() => {
+      if (selectedProject) {
+        fetchGitStatus();
+        fetchBranches();
+        if (activeView === 'history') {
+          fetchRecentCommits();
+        }
+      }
+    }, 300); // 300ms debounce
+    
+    // Cleanup timeout on unmount or dependency change
+    return () => {
+      if (fetchTimeoutRef.current) {
+        clearTimeout(fetchTimeoutRef.current);
+      }
+    };
+  }, [selectedProject?.name, activeView]); // Use selectedProject.name instead of full object to prevent unnecessary reruns
 
   // Handle click outside dropdown
   useEffect(() => {
@@ -67,6 +83,11 @@ function GitPanel({ selectedProject, isMobile }) {
         setGitStatus(data);
         setCurrentBranch(data.branch || 'main');
         
+        // Clear cached diffs and loading states when refreshing git status
+        setGitDiff({});
+        setLoadingDiffs(new Set());
+        setExpandedFiles(new Set()); // Also collapse expanded files to avoid showing stale diffs
+        
         // Auto-select all changed files
         const allFiles = new Set([
           ...(data.modified || []),
@@ -76,13 +97,10 @@ function GitPanel({ selectedProject, isMobile }) {
         ]);
         setSelectedFiles(allFiles);
         
-        // Fetch diffs for changed files
-        for (const file of data.modified || []) {
-          fetchFileDiff(file);
-        }
-        for (const file of data.added || []) {
-          fetchFileDiff(file);
-        }
+        // OPTIMIZATION: Don't automatically fetch all diffs - use lazy loading instead
+        // This prevents making 121 HTTP requests immediately with 121 modified files
+        // Diffs will be fetched only when user expands a file
+        console.log(`📊 Git status loaded: ${data.modified?.length || 0} modified, ${data.added?.length || 0} added, ${data.deleted?.length || 0} deleted, ${data.untracked?.length || 0} untracked files`);
       }
     } catch (error) {
       console.error('Error fetching git status:', error);
@@ -161,6 +179,14 @@ function GitPanel({ selectedProject, isMobile }) {
   };
 
   const fetchFileDiff = async (filePath) => {
+    // Don't fetch if already loading or already loaded
+    if (loadingDiffs.has(filePath) || gitDiff[filePath]) {
+      return;
+    }
+    
+    // Mark as loading
+    setLoadingDiffs(prev => new Set([...prev, filePath]));
+    
     try {
       const response = await fetch(`/api/git/diff?project=${encodeURIComponent(selectedProject.name)}&file=${encodeURIComponent(filePath)}`);
       const data = await response.json();
@@ -173,6 +199,13 @@ function GitPanel({ selectedProject, isMobile }) {
       }
     } catch (error) {
       console.error('Error fetching file diff:', error);
+    } finally {
+      // Remove from loading set
+      setLoadingDiffs(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(filePath);
+        return newSet;
+      });
     }
   };
 
@@ -237,6 +270,8 @@ function GitPanel({ selectedProject, isMobile }) {
         newSet.delete(filePath);
       } else {
         newSet.add(filePath);
+        // LAZY LOADING: Only fetch diff when user actually expands the file
+        fetchFileDiff(filePath);
       }
       return newSet;
     });
@@ -380,6 +415,7 @@ function GitPanel({ selectedProject, isMobile }) {
     const isExpanded = expandedFiles.has(filePath);
     const isSelected = selectedFiles.has(filePath);
     const diff = gitDiff[filePath];
+    const isLoadingDiff = loadingDiffs.has(filePath);
     
     return (
       <div key={filePath} className="border-b border-gray-200 dark:border-gray-700 last:border-0">
@@ -412,7 +448,7 @@ function GitPanel({ selectedProject, isMobile }) {
             </span>
           </div>
         </div>
-        {isExpanded && diff && (
+        {isExpanded && (
           <div className="bg-gray-50 dark:bg-gray-900">
             {isMobile && (
               <div className="flex justify-end p-2 border-b border-gray-200 dark:border-gray-700">
@@ -429,7 +465,20 @@ function GitPanel({ selectedProject, isMobile }) {
               </div>
             )}
             <div className="max-h-96 overflow-y-auto p-2">
-              {diff.split('\n').map((line, index) => renderDiffLine(line, index))}
+              {isLoadingDiff ? (
+                <div className="flex items-center justify-center py-8">
+                  <div className="flex items-center space-x-2 text-gray-500 dark:text-gray-400">
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    <span className="text-sm">Loading diff...</span>
+                  </div>
+                </div>
+              ) : diff ? (
+                diff.split('\n').map((line, index) => renderDiffLine(line, index))
+              ) : (
+                <div className="flex items-center justify-center py-8">
+                  <span className="text-sm text-gray-500 dark:text-gray-400">No changes to display</span>
+                </div>
+              )}
             </div>
           </div>
         )}

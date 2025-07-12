@@ -74,7 +74,93 @@ function AppContent() {
   // until the conversation completes or is aborted.
   const [activeSessions, setActiveSessions] = useState(new Set()); // Track sessions with active conversations
   
+  // Track processed WebSocket messages to prevent infinite loops
+  const [processedMessageIds, setProcessedMessageIds] = useState(new Set());
+  
+  // Clean up old processed message IDs periodically to prevent memory leaks
+  useEffect(() => {
+    const cleanup = setInterval(() => {
+      setProcessedMessageIds(prev => {
+        // Keep only recent message IDs (last 100)
+        const messageArray = Array.from(prev);
+        if (messageArray.length > 100) {
+          return new Set(messageArray.slice(-50)); // Keep last 50
+        }
+        return prev;
+      });
+    }, 60000); // Clean up every minute
+    
+    return () => clearInterval(cleanup);
+  }, []);
+  
   const { ws, sendMessage, messages } = useWebSocket();
+
+  // Helper function to add placeholder sessions to project data
+  const addPlaceholderSessions = (projects) => {
+    const storedPlaceholders = JSON.parse(localStorage.getItem('placeholderSessions') || '{}');
+    const now = Date.now();
+    const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+    const projectNames = new Set(projects.map(project => project.name));
+    const pendingConversionTimeout = 5 * 60 * 1000; // 5 minutes timeout for pending conversions
+    
+    // Filter valid placeholders
+    const validPlaceholders = {};
+    Object.entries(storedPlaceholders).forEach(([sessionId, placeholderData]) => {
+      const isRecent = now - placeholderData.createdAt < maxAge;
+      const projectExists = projectNames.has(placeholderData.projectName);
+      const isPendingConversion = placeholderData.pendingConversion;
+      const pendingConversionExpired = isPendingConversion && 
+        (now - (placeholderData.pendingConversionTime || 0)) > pendingConversionTimeout;
+      
+      if (isRecent && projectExists && !isPendingConversion && !pendingConversionExpired) {
+        validPlaceholders[sessionId] = placeholderData;
+      } else {
+        if (!isRecent) {
+          console.log(`🧹 Cleaning up old placeholder session: ${sessionId}`);
+        } else if (!projectExists) {
+          console.log(`🧹 Cleaning up orphaned placeholder session for deleted project: ${placeholderData.projectName}`);
+        } else if (isPendingConversion) {
+          console.log(`🧹 Cleaning up placeholder session pending conversion: ${sessionId}`);
+        } else if (pendingConversionExpired) {
+          console.log(`🧹 Cleaning up expired pending conversion: ${sessionId}`);
+        }
+      }
+    });
+    
+    // Update localStorage with cleaned placeholders
+    if (Object.keys(validPlaceholders).length !== Object.keys(storedPlaceholders).length) {
+      localStorage.setItem('placeholderSessions', JSON.stringify(validPlaceholders));
+      console.log(`🧹 Cleaned up ${Object.keys(storedPlaceholders).length - Object.keys(validPlaceholders).length} invalid placeholder sessions`);
+    }
+    
+    // Add placeholder sessions to projects
+    return projects.map(project => {
+      const projectPlaceholders = Object.entries(validPlaceholders)
+        .filter(([sessionId, placeholderData]) => placeholderData.projectName === project.name)
+        .map(([sessionId, placeholderData]) => ({
+          id: sessionId,
+          title: placeholderData.title,
+          summary: placeholderData.summary,
+          created_at: placeholderData.created_at,
+          updated_at: placeholderData.updated_at,
+          lastActivity: placeholderData.lastActivity,
+          isPlaceholder: true
+        }));
+      
+      if (projectPlaceholders.length > 0) {
+        return {
+          ...project,
+          sessions: [...projectPlaceholders, ...(project.sessions || [])],
+          sessionMeta: {
+            ...project.sessionMeta,
+            total: (project.sessionMeta?.total || 0) + projectPlaceholders.length
+          }
+        };
+      }
+      
+      return project;
+    });
+  };
 
   useEffect(() => {
     const checkMobile = () => {
@@ -113,6 +199,13 @@ function AppContent() {
     const currentSelectedSession = currentSelectedProject.sessions?.find(s => s.id === selectedSession.id);
     const updatedSelectedSession = updatedSelectedProject.sessions?.find(s => s.id === selectedSession.id);
 
+    // Special case: If the selected session is a placeholder (temp- or isPlaceholder),
+    // allow the update because placeholder sessions are meant to be replaced with real sessions
+    if (selectedSession.isPlaceholder || selectedSession.id?.startsWith('temp-')) {
+      console.log('🗂️ Allowing update for placeholder session:', selectedSession.id);
+      return true;
+    }
+
     if (!currentSelectedSession || !updatedSelectedSession) {
       // Selected session was deleted or significantly changed, not purely additive
       return false;
@@ -136,6 +229,17 @@ function AppContent() {
     if (messages.length > 0) {
       const latestMessage = messages[messages.length - 1];
       
+      // Create a unique ID for this message to prevent duplicate processing
+      const messageId = `${latestMessage.type}-${latestMessage.timestamp || Date.now()}-${JSON.stringify(latestMessage).slice(0, 100)}`;
+      
+      // Skip if we've already processed this message
+      if (processedMessageIds.has(messageId)) {
+        return;
+      }
+      
+      // Mark this message as processed
+      setProcessedMessageIds(prev => new Set([...prev, messageId]));
+      
       if (latestMessage.type === 'projects_updated') {
         
         // Session Protection Logic: Allow additions but prevent changes during active conversations
@@ -143,37 +247,62 @@ function AppContent() {
         // We check for two types of active sessions:
         // 1. Existing sessions: selectedSession.id exists in activeSessions
         // 2. New sessions: temporary "new-session-*" identifiers in activeSessions (before real session ID is received)
-        const hasActiveSession = (selectedSession && activeSessions.has(selectedSession.id)) ||
-                                 (activeSessions.size > 0 && Array.from(activeSessions).some(id => id.startsWith('new-session-')));
+        const currentSelectedSession = selectedSession;
+        const currentSelectedProject = selectedProject;
+        const currentActiveSessions = activeSessions;
+        
+        const hasActiveSession = (currentSelectedSession && currentActiveSessions.has(currentSelectedSession.id)) ||
+                                 (currentActiveSessions.size > 0 && Array.from(currentActiveSessions).some(id => id.startsWith('new-session-')));
         
         if (hasActiveSession) {
           // Allow updates but be selective: permit additions, prevent changes to existing items
           const updatedProjects = latestMessage.projects;
-          const currentProjects = projects;
+          
+          console.log('🗂️ Session protection active, checking if update is additive:', {
+            selectedSessionId: currentSelectedSession?.id,
+            isPlaceholder: currentSelectedSession?.isPlaceholder,
+            activeSessionsCount: currentActiveSessions.size,
+            activeSessions: Array.from(currentActiveSessions)
+          });
           
           // Check if this is purely additive (new sessions/projects) vs modification of existing ones
-          const isAdditiveUpdate = isUpdateAdditive(currentProjects, updatedProjects, selectedProject, selectedSession);
+          const isAdditiveUpdate = isUpdateAdditive(projects, updatedProjects, currentSelectedProject, currentSelectedSession);
+          
+          console.log('🗂️ Update additive check result:', isAdditiveUpdate);
           
           if (!isAdditiveUpdate) {
             // Skip updates that would modify existing selected session/project
+            console.log('🗂️ Skipping non-additive update during active session');
             return;
           }
           // Continue with additive updates below
+          console.log('🗂️ Allowing additive update during active session');
         }
         
         // Update projects state with the new data from WebSocket
         const updatedProjects = latestMessage.projects;
-        setProjects(updatedProjects);
+        
+        // IMPORTANT: Add placeholder sessions to the updated projects to prevent them from disappearing
+        const updatedProjectsWithPlaceholders = addPlaceholderSessions(updatedProjects);
+        
+        // Only update if the projects data has actually changed to prevent unnecessary re-renders
+        setProjects(prevProjects => {
+          // Deep comparison to check if projects have actually changed
+          if (JSON.stringify(prevProjects) === JSON.stringify(updatedProjectsWithPlaceholders)) {
+            return prevProjects; // No changes, keep existing state
+          }
+          return updatedProjectsWithPlaceholders;
+        });
         
         // Update selected project if it exists in the updated projects
-        if (selectedProject) {
-          const updatedSelectedProject = updatedProjects.find(p => p.name === selectedProject.name);
-          if (updatedSelectedProject) {
+        if (currentSelectedProject) {
+          const updatedSelectedProject = updatedProjectsWithPlaceholders.find(p => p.name === currentSelectedProject.name);
+          if (updatedSelectedProject && JSON.stringify(updatedSelectedProject) !== JSON.stringify(currentSelectedProject)) {
             setSelectedProject(updatedSelectedProject);
             
             // Update selected session only if it was deleted - avoid unnecessary reloads
-            if (selectedSession) {
-              const updatedSelectedSession = updatedSelectedProject.sessions?.find(s => s.id === selectedSession.id);
+            if (currentSelectedSession) {
+              const updatedSelectedSession = updatedSelectedProject.sessions?.find(s => s.id === currentSelectedSession.id);
               if (!updatedSelectedSession) {
                 // Session was deleted
                 setSelectedSession(null);
@@ -184,7 +313,7 @@ function AppContent() {
         }
       }
     }
-  }, [messages, selectedProject, selectedSession, activeSessions]);
+  }, [messages]); // Only depend on messages to prevent infinite loops
 
   const fetchProjects = async () => {
     try {
@@ -192,51 +321,8 @@ function AppContent() {
       const response = await fetch('/api/projects');
       const data = await response.json();
       
-      // Restore placeholder sessions from localStorage
-      const storedPlaceholders = JSON.parse(localStorage.getItem('placeholderSessions') || '{}');
-      const now = Date.now();
-      const maxAge = 24 * 60 * 60 * 1000; // 24 hours
-      
-      // Clean up old placeholders (older than 24 hours)
-      const validPlaceholders = {};
-      Object.entries(storedPlaceholders).forEach(([sessionId, placeholderData]) => {
-        if (now - placeholderData.createdAt < maxAge) {
-          validPlaceholders[sessionId] = placeholderData;
-        }
-      });
-      
-      // Update localStorage with cleaned placeholders
-      if (Object.keys(validPlaceholders).length !== Object.keys(storedPlaceholders).length) {
-        localStorage.setItem('placeholderSessions', JSON.stringify(validPlaceholders));
-      }
-      
-      // Add placeholder sessions back to their respective projects
-      const dataWithPlaceholders = data.map(project => {
-        const projectPlaceholders = Object.entries(validPlaceholders)
-          .filter(([sessionId, placeholderData]) => placeholderData.projectName === project.name)
-          .map(([sessionId, placeholderData]) => ({
-            id: sessionId,
-            title: placeholderData.title,
-            summary: placeholderData.summary,
-            created_at: placeholderData.created_at,
-            updated_at: placeholderData.updated_at,
-            lastActivity: placeholderData.lastActivity,
-            isPlaceholder: true
-          }));
-        
-        if (projectPlaceholders.length > 0) {
-          return {
-            ...project,
-            sessions: [...projectPlaceholders, ...(project.sessions || [])],
-            sessionMeta: {
-              ...project.sessionMeta,
-              total: (project.sessionMeta?.total || 0) + projectPlaceholders.length
-            }
-          };
-        }
-        
-        return project;
-      });
+      // Use the helper function to add placeholder sessions
+      const dataWithPlaceholders = addPlaceholderSessions(data);
       
       // Optimize to preserve object references when data hasn't changed
       setProjects(prevProjects => {
@@ -326,6 +412,10 @@ function AppContent() {
     if (session === null) {
       navigate('/');
     } else {
+      // Mark placeholder sessions as active to protect them from being removed by updates
+      if (session.isPlaceholder && session.id) {
+        markSessionAsActive(session.id);
+      }
       navigate(`/session/${session.id}`);
     }
   };
@@ -370,24 +460,7 @@ function AppContent() {
     };
     localStorage.setItem('placeholderSessions', JSON.stringify(existingPlaceholders));
 
-    // Add placeholder session to the project
-    setProjects(prevProjects => 
-      prevProjects.map(p => {
-        if (p.name === project.name) {
-          return {
-            ...p,
-            sessions: [placeholderSession, ...(p.sessions || [])],
-            sessionMeta: {
-              ...p.sessionMeta,
-              total: (p.sessionMeta?.total || 0) + 1
-            }
-          };
-        }
-        return p;
-      })
-    );
-
-    // Update selected project to include the new session
+    // Create the updated project with the new session first
     const updatedProject = {
       ...project,
       sessions: [placeholderSession, ...(project.sessions || [])],
@@ -397,13 +470,31 @@ function AppContent() {
       }
     };
 
+    // Update projects state immediately and ensure it persists
+    const updatedProjects = projects.map(p => {
+      if (p.name === project.name) {
+        return updatedProject;
+      }
+      return p;
+    });
+
+    // Force immediate state updates synchronously
+    setProjects(updatedProjects);
     setSelectedProject(updatedProject);
     setSelectedSession(placeholderSession);
     setActiveTab('chat');
+    
+    // Mark placeholder session as active to protect it from being removed by updates
+    markSessionAsActive(placeholderSessionId);
+    
+    // Navigate and close mobile sidebar
     navigate(`/session/${placeholderSessionId}`);
     if (isMobile) {
       setSidebarOpen(false);
     }
+    
+    console.log(`✨ Created placeholder session: ${placeholderSessionId} for project: ${project.name}`);
+    console.log(`📊 Updated projects state with ${updatedProjects.length} projects`);
   };
 
   const handleSessionDelete = (sessionId) => {
@@ -441,41 +532,37 @@ function AppContent() {
       const response = await fetch('/api/projects');
       const freshProjects = await response.json();
       
-      // Optimize to preserve object references and minimize re-renders
-      setProjects(prevProjects => {
-        // Check if projects data has actually changed
-        const hasChanges = freshProjects.some((newProject, index) => {
-          const prevProject = prevProjects[index];
-          if (!prevProject) return true;
-          
-          return (
-            newProject.name !== prevProject.name ||
-            newProject.displayName !== prevProject.displayName ||
-            newProject.fullPath !== prevProject.fullPath ||
-            JSON.stringify(newProject.sessionMeta) !== JSON.stringify(prevProject.sessionMeta) ||
-            JSON.stringify(newProject.sessions) !== JSON.stringify(prevProject.sessions)
-          );
-        }) || freshProjects.length !== prevProjects.length;
-        
-        return hasChanges ? freshProjects : prevProjects;
-      });
+      // Use the helper function to add placeholder sessions
+      const freshProjectsWithPlaceholders = addPlaceholderSessions(freshProjects);
+      
+      // Store current selected project name to restore after update
+      const currentSelectedProjectName = selectedProject?.name;
+      
+      // Update projects state
+      setProjects(freshProjectsWithPlaceholders);
       
       // If we have a selected project, make sure it's still selected after refresh
-      if (selectedProject) {
-        const refreshedProject = freshProjects.find(p => p.name === selectedProject.name);
+      if (currentSelectedProjectName) {
+        const refreshedProject = freshProjectsWithPlaceholders.find(p => p.name === currentSelectedProjectName);
         if (refreshedProject) {
-          // Only update selected project if it actually changed
-          if (JSON.stringify(refreshedProject) !== JSON.stringify(selectedProject)) {
-            setSelectedProject(refreshedProject);
-          }
+          // Always update the selected project to get the latest data
+          setSelectedProject(refreshedProject);
           
           // If we have a selected session, try to find it in the refreshed project
           if (selectedSession) {
             const refreshedSession = refreshedProject.sessions?.find(s => s.id === selectedSession.id);
-            if (refreshedSession && JSON.stringify(refreshedSession) !== JSON.stringify(selectedSession)) {
+            if (refreshedSession) {
               setSelectedSession(refreshedSession);
+            } else {
+              // Session was deleted, clear it
+              setSelectedSession(null);
             }
           }
+        } else {
+          // Project was deleted, clear selection
+          setSelectedProject(null);
+          setSelectedSession(null);
+          navigate('/');
         }
       }
     } catch (error) {
@@ -540,10 +627,15 @@ function AppContent() {
   // replacePlaceholderSession: Called when a real session is created to replace placeholder
   const replacePlaceholderSession = (realSessionId, placeholderSessionId) => {
     if (realSessionId && placeholderSessionId) {
-      // Clean up placeholder from localStorage
+      // Clean up placeholder from localStorage with additional safeguards
       const existingPlaceholders = JSON.parse(localStorage.getItem('placeholderSessions') || '{}');
-      delete existingPlaceholders[placeholderSessionId];
-      localStorage.setItem('placeholderSessions', JSON.stringify(existingPlaceholders));
+      if (existingPlaceholders[placeholderSessionId]) {
+        delete existingPlaceholders[placeholderSessionId];
+        localStorage.setItem('placeholderSessions', JSON.stringify(existingPlaceholders));
+        console.log(`🔄 Replaced placeholder session ${placeholderSessionId} with real session ${realSessionId}`);
+      } else {
+        console.log(`⚠️ Placeholder session ${placeholderSessionId} not found in localStorage during replacement`);
+      }
 
       // Remove placeholder session ID from active sessions and add real session ID
       setActiveSessions(prev => {
@@ -824,6 +916,8 @@ function AppContent() {
               projects={projects}
               selectedProject={selectedProject}
               selectedSession={selectedSession}
+              selectedConversation={selectedConversation}
+              targetSessionId={targetSessionId}
               onProjectSelect={handleProjectSelect}
               onSessionSelect={handleSessionSelect}
               onConversationSelect={handleConversationSelect}
@@ -883,6 +977,8 @@ function AppContent() {
               projects={projects}
               selectedProject={selectedProject}
               selectedSession={selectedSession}
+              selectedConversation={selectedConversation}
+              targetSessionId={targetSessionId}
               onProjectSelect={handleProjectSelect}
               onSessionSelect={handleSessionSelect}
               onConversationSelect={handleConversationSelect}
@@ -922,9 +1018,11 @@ function AppContent() {
           onReplaceTemporarySession={replaceTemporarySession}
           onReplacePlaceholderSession={replacePlaceholderSession}
           onNavigateToSession={(sessionId) => navigate(`/session/${sessionId}`)}
+          onConversationSelect={handleConversationSelect}
           onShowSettings={() => setShowToolsSettings(true)}
           autoExpandTools={autoExpandTools}
           showRawParameters={showRawParameters}
+          autoScrollToBottom={autoScrollToBottom}
           onProjectUpdate={fetchProjects}
           onUpdateSessionActivity={updateSessionActivity}
         />
